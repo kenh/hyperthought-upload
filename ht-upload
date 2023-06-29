@@ -1,10 +1,8 @@
 #!/bin/sh
 #
-# $Id: ht-upload,v 1.3 2023/06/13 14:05:31 kenh Exp $
+# ht-upload - An upload program for HyperThought
 #
-# ht-upload - A proof-of-concept upload program for HyperThought
-#
-# Requirements in path: openssl, curl, awk
+# Requirements in path: curl, awk, sed
 #
 
 : "${HYPERTHOUGHT_URL:=}"
@@ -17,9 +15,19 @@ EXPIRE=0
 HTTMPFILES="/tmp/htupload.$$"
 ENDPOINTS="${HTTMPFILES}.endpoints"
 
+if [ "$1" = -D ]; then
+	shift
+	if [ $# -eq 0 ]; then
+		echo "-D requires an argument" >&2
+		exit 1
+	fi
+	DIRECTORY="$1"
+	shift
+fi
+
 if [ $# -eq 0 ]; then
 cat <<EOF
-Usage: $0 filename [filename ...]
+Usage: $0 [-D directory] filename [filename ...]
 
 Environment variables:
 
@@ -33,6 +41,18 @@ EOF
 fi
 
 #
+# Make sure the required variables are set
+#
+
+for var in HYPERTHOUGHT_URL CLIENT_ID CLIENT_SECRET WORKSPACE
+do
+	if [ -z "$(eval echo \${$var})" ]; then
+		echo "A value for $var is required" >&2
+		exit 1
+	fi
+done
+
+#
 # Make sure curl exists
 #
 
@@ -41,7 +61,7 @@ if [ -z "$(command -v curl 2>/dev/null)" ]; then
 	exit 1
 fi
 
-#trap "rm -f ${HTTMPFILES}*" EXIT 1 2 3 15
+trap "rm -f ${HTTMPFILES}*" EXIT 1 2 3 15
 
 #
 # Check to see if we need to add a capath depending on the OS
@@ -473,16 +493,24 @@ function is_value(a1) { #{{{1
 }
 
 #
-# Look for particular items from parsed json output
+# Look for particular items from parsed json output.
+#
+# Arguments are:
+#
+# $1 - JSON entry to match (quotes will be added)
+# $2 - Variable to assign to array
+# $3 - File to read
+# $4 - Array index to match (optional)
 #
 
 get_entry()
 {
-	tmp=$(awk '$1 == "[\"'$1'\"]" {
+	tmp=$(awk -F"\t" '$1 == "['${4:+$4,}'\"'$1'\"]" {
 			if ($2 ~ /^".*"$/)
 				print substr($2, 2, length($2) - 2)
 			else
 				print $2
+			exit
 			} ' "$3")
 	if [ -z "$tmp" ]; then
 		echo "Cannot find $1 in $3"
@@ -515,12 +543,12 @@ get_new_token()
 
 do_curl()
 {
+	quiet="-s -S"
+	progress=
+
 	if [ "$1" == "-N" ]; then
 		shift
 		bopt=
-		progress=
-	elif [ "$1" == "-#" ]; then
-		progress="-#"
 	else
 		if [ $(date +%s) -gt "$EXPIRE" ]; then
 			get_new_token
@@ -528,13 +556,18 @@ do_curl()
 		bopt="$BEARER"
 	fi
 
-	if [ "$VERBOSE" -eq 1 ]; then
-		echo curl ${CURL_PROXY:+-x $CURL_PROXY }${CAPATH:+--capath $CAPATH }${bopt:+-H "Authorization: Bearer $bopt" }-f -b "dodAccessBanner=true" -S "$@" 1>&2
+	if [ "$1" == "-#" ]; then
+		quiet="-S"
+		shift
 	fi
 
-	curl ${CURL_PROXY:+-x $CURL_PROXY }${CAPATH:+--capath $CAPATH }${bopt:+-H "Authorization: Bearer $bopt" }-f -b "dodAccessBanner=true" -S "$@"
+	if [ "$VERBOSE" -eq 1 ]; then
+		echo curl ${CURL_PROXY:+-x $CURL_PROXY }${CAPATH:+--capath $CAPATH }${bopt:+-H "Authorization: Bearer $bopt" }-f -b "dodAccessBanner=true" $quiet "$@" 1>&2
+	fi
+
+	curl ${CURL_PROXY:+-x $CURL_PROXY }${CAPATH:+--capath $CAPATH }${bopt:+-H "Authorization: Bearer $bopt" }-f -b "dodAccessBanner=true" $quiet "$@"
 	if [ $? != 0 ]; then
-		echo "Curl failed"
+		echo "Curl failed" >&2
 		exit 1
 	fi
 }
@@ -545,13 +578,81 @@ do_curl -N "${HYPERTHOUGHT_URL}/openid/.well-known/openid-configuration" > "$END
 json_awk "$ENDPOINTS.unparsed" > "$ENDPOINTS"
 get_entry "token_endpoint" token_endpoint "$ENDPOINTS"
 
+#
+# If the workspace was NOT a UUID, then try to find the workspace alias
+# out of the list of all workspaces available to us.
+#
+
+if [ -z $(printf "%s\n" "$WORKSPACE" | grep -E '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') ]; then
+	echo "Getting UUID for workspace $WORKSPACE"
+	do_curl \
+		-H "accept: application/json" \
+		"$HYPERTHOUGHT_URL/api/workspace/" \
+		> "$HTTMPFILES.wslist.unparsed"
+	json_awk "$HTTMPFILES.wslist.unparsed" > "$HTTMPFILES.wslist"
+	tmp=$(awk '$1 ~ /^\[[0-9]+,"alias"\]$/ && $2 == "\"'$WORKSPACE'\"" {
+		print $1
+		exit }' "$HTTMPFILES.wslist" | sed -e 's/^\[\([0-9]\{1,\}\),.*/\1/')
+	if [ -z "$tmp" ]; then
+		echo "Cannot find workspace $WORKSPACE.  Available workspaces are:"
+		grep -E '^\[[0-9]+,"alias"\]' "$HTTMPFILES.wslist" | awk '{ print "\t" substr($2, 2, length($2) - 2) }'
+		exit 1
+	else
+		get_entry id WORKSPACE "$HTTMPFILES.wslist" "$tmp"
+		echo "Workspace ID is $WORKSPACE"
+	fi
+fi
+
 # Make sure the workspace is visible to us
 do_curl "${HYPERTHOUGHT_URL}/api/workspace/$WORKSPACE/" > "$HTTMPFILES.workspace"
 
 if [ "$(cat $HTTMPFILES.workspace)" == '{}' ]; then
-	echo "No information found about workspace $WORKSPACE"
-	echo "Does this service account have access to it?"
+	echo "No information found about workspace $WORKSPACE" >&2
+	echo "Does this service account have access to it?" >&2
 	exit 1
+fi
+
+if [ -n "$DIRECTORY" ]; then
+	echo "Creating directory $DIRECTORY"
+
+	#
+	# Escape any backslashes or double quotes just in case
+	#
+
+	DIRECTORY=$(printf "%s\n" "$DIRECTORY" | sed -e 's/\(["\]\)/\\\1/g')
+
+	#
+	# Note this is using a legacy API; v1 doesn't have create folder yet
+	#
+
+	do_curl \
+		-X POST \
+		-H "accept: application/json" \
+		-H "Content-Type: application/json" \
+		-d "{\"space_id\":\"$WORKSPACE\",\"path\":\",\",\"name\":\"$DIRECTORY\"}" \
+		"${HYPERTHOUGHT_URL}/api/files/create-folder/" \
+		> "$HTTMPFILES.newfolder.unparsed"
+	json_awk "$HTTMPFILES.newfolder.unparsed" > "$HTTMPFILES.newfolder"
+
+	#
+	# Why \\\"?  Well, the 4th argument ends up "raw" in an awk statement
+	# and the awk string is already surrounded by double quotes.  So
+	# we need:
+	#
+	#	\\	To get a single '\' in the string
+	#	\"	To get a double quote in the string
+	#
+	#	So the resulting string that awk sees after expansion
+	#	is:	"[\"foo1\",...]"
+	#
+	# And it all works out.  (The first search term already has the
+	# quoting and escapes applied).
+	#
+
+	get_entry "pk" diruuid "$HTTMPFILES.newfolder" "\\\"document\\\",\\\"content\\\""
+	UPLOADPATH=",${diruuid},"
+else
+	UPLOADPATH=","
 fi
 
 for file in "$@"
@@ -559,12 +660,30 @@ do
 	echo "Uploading $file"
 	bname=$(basename "$file")
 	size=$(ls -l "$file" | awk '{print $5}')
-	do_curl -X POST -H "accept: application/json" -H "Content-Type: application/json" -d "{\"workspaceId\":\"$WORKSPACE\",\"name\":\"$bname\",\"path\":\",\",\"size\":$size}" "${HYPERTHOUGHT_URL}/api/files/v1/generate-upload-url/" > "$HTTMPFILES.upload.unparsed"
+	do_curl \
+		-X POST \
+		-H "accept: application/json" \
+		-H "Content-Type: application/json" \
+		-d "{\"workspaceId\":\"$WORKSPACE\",\"name\":\"$bname\",\"path\":\"$UPLOADPATH\",\"size\":$size}" \
+		"${HYPERTHOUGHT_URL}/api/files/v1/generate-upload-url/" \
+		> "$HTTMPFILES.upload.unparsed"
 	json_awk "$HTTMPFILES.upload.unparsed" > "$HTTMPFILES.upload"
 	get_entry "url" uploadurl "$HTTMPFILES.upload"
 	get_entry "resources\\\",\\\"tempToPerm" temptoperm "$HTTMPFILES.upload"
-	do_curl -X PUT -H "Content-Type: application/octet-stream" -H "Content-Disposition: inline;filename=\"$bname\"" --data-binary "@$file" "${HYPERTHOUGHT_URL}${uploadurl}"
-	do_curl -X PATCH "${HYPERTHOUGHT_URL}${temptoperm}"
+	do_curl \
+		-# \
+		-H "Content-Type: application/octet-stream" \
+		-H "Content-Disposition: inline;filename=\"$bname\"" \
+		-o "$HTTMPFILES.fileupload.unparsed" \
+		-T "$file" \
+		"${HYPERTHOUGHT_URL}${uploadurl}"
+	json_awk "$HTTMPFILES.fileupload.unparsed" > "$HTTMPFILES.fileupload"
+	get_entry message status "$HTTMPFILES.fileupload"
+	echo "$bname: $status"
+	do_curl -X PATCH "${HYPERTHOUGHT_URL}${temptoperm}" > "$HTTMPFILES.toperm.unparsed"
+	json_awk "$HTTMPFILES.toperm.unparsed" > "$HTTMPFILES.toperm"
+	get_entry message status "$HTTMPFILES.toperm"
+	echo "$bname: $status"
 done
 
 exit 0
